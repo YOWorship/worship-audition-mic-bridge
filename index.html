@@ -1,1 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Audition Microphone Recorder</title>
+<style>
+*{box-sizing:border-box}
+body{font:16px system-ui,sans-serif;background:#f5f7fa;color:#17202a;margin:0;padding:24px 16px}
+main{max-width:520px;margin:24px auto;padding:24px;background:white;border:1px solid #dce2e8;border-radius:16px}
+h1{font-size:1.35rem}
+.muted{color:#586574;font-size:.92rem;line-height:1.45}
+.status{padding:12px;border-radius:10px;background:#f0f3f6;margin:16px 0;min-height:2.5em}
+.warning{background:#fff4df;color:#694500}.error{background:#fdeaea;color:#8b1e1e}.success{background:#e8f6ed;color:#185c32}
+.controls{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0}
+button{border:0;border-radius:10px;padding:12px 16px;font:inherit;font-weight:650;cursor:pointer}
+button:disabled{opacity:.45;cursor:not-allowed}
+#start{background:#1769d2;color:white}#stop{background:#a52a2a;color:white}#send{background:#176b3a;color:white}
+audio{width:100%;margin-top:12px}
+</style>
+</head>
+<body>
+<main>
+<h1>Audition Microphone Recorder</h1>
+<p class="muted">Audio is recorded in this browser. This page does not upload the recording to a server. It sends the recording only to the audition form window that opened it, after you select Send.</p>
+<div id="status" class="status warning" role="status" aria-live="polite">Checking connection…</div>
+<p id="destination" class="muted"></p>
+<div class="controls">
+<button id="start" disabled>Start recording</button>
+<button id="stop" disabled>Stop</button>
+<button id="send" disabled>Send recording to audition form</button>
+</div>
+<p id="timer" class="muted">Recording time: 00:00</p>
+<audio id="preview" controls hidden></audio>
+<p class="muted">Maximum recording time: 5 minutes. Maximum file size: 4 MB. Keep this window open until sending finishes.</p>
+</main>
+<script>
+(() => {
+"use strict";
+const MAX_MS = 5 * 60 * 1000;
+const MAX_BYTES = 4 * 1024 * 1024;
+const APPROVED_PARENT_HOST = host =>
+  host === "script.google.com" ||
+  (host.endsWith(".googleusercontent.com") && host.includes("script"));
+const $ = id => document.getElementById(id);
+const status = $("status"), start = $("start"), stop = $("stop"), send = $("send"), preview = $("preview");
+let parentOrigin = "", stream = null, recorder = null, chunks = [], blob = null;
+let started = 0, timer = null, previewUrl = null;
 
+function say(message, kind = "") {
+  status.textContent = message;
+  status.className = "status " + kind;
+}
+function sendMessage(type, extra = {}) {
+  if (!window.opener || window.opener.closed) throw new Error("The audition form window is no longer available.");
+  window.opener.postMessage({channel:"audition-mic-bridge-v1", type, ...extra}, parentOrigin);
+}
+function stopTracks() {
+  if (stream) stream.getTracks().forEach(track => track.stop());
+  stream = null;
+}
+function formatTime(ms) {
+  const total = Math.floor(ms / 1000);
+  return String(Math.floor(total / 60)).padStart(2,"0") + ":" + String(total % 60).padStart(2,"0");
+}
+function supportedMimeType() {
+  if (!window.MediaRecorder || !MediaRecorder.isTypeSupported) return "";
+  return ["audio/mp4", "audio/webm;codecs=opus", "audio/webm"]
+    .find(type => MediaRecorder.isTypeSupported(type)) || "";
+}
+async function startRecording() {
+  start.disabled = true;
+  send.disabled = true;
+  say("Requesting microphone access…");
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error("Microphone access is unavailable in this browser.");
+    }
+    if (!window.MediaRecorder) throw new Error("This browser does not support audio recording.");
+    const type = supportedMimeType();
+    if (!type) throw new Error("No supported audio recording format was found.");
+
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {echoCancellation:true, noiseSuppression:true, autoGainControl:true}
+    });
+    chunks = [];
+    blob = null;
+    recorder = new MediaRecorder(stream, {mimeType:type});
+    recorder.addEventListener("dataavailable", event => {
+      if (event.data && event.data.size) chunks.push(event.data);
+    });
+    recorder.addEventListener("stop", () => {
+      clearInterval(timer);
+      timer = null;
+      stopTracks();
+      blob = new Blob(chunks, {type:recorder.mimeType || type});
+      chunks = [];
+      stop.disabled = true;
+      if (!blob.size) {
+        say("No audio was captured. Please try again.", "error");
+        start.disabled = false;
+        send.disabled = true;
+        return;
+      }
+      if (blob.size > MAX_BYTES) {
+        blob = null;
+        say("Recording exceeds 4 MB. Please make a shorter recording.", "error");
+        start.disabled = false;
+        send.disabled = true;
+        return;
+      }
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+      previewUrl = URL.createObjectURL(blob);
+      preview.src = previewUrl;
+      preview.hidden = false;
+      start.disabled = false;
+      send.disabled = false;
+      say("Recording ready. Play it back, then send it to the audition form.", "success");
+      try { sendMessage("recording-stopped"); } catch (e) {}
+    });
+    recorder.addEventListener("error", event => {
+      say("Recording error: " + (event.error && event.error.message ? event.error.message : "Browser error"), "error");
+      try { sendMessage("bridge-error", {message:"The browser reported a recording error."}); } catch (e) {}
+    });
+    started = Date.now();
+    recorder.start(1000);
+    stop.disabled = false;
+    say("Recording. Press Stop when finished.");
+    sendMessage("recording-started");
+    timer = setInterval(() => {
+      const elapsed = Date.now() - started;
+      $("timer").textContent = "Recording time: " + formatTime(elapsed);
+      if (elapsed >= MAX_MS && recorder && recorder.state === "recording") recorder.stop();
+    }, 250);
+  } catch (error) {
+    stopTracks();
+    start.disabled = false;
+    stop.disabled = true;
+    say(error.message || "Microphone access failed.", "error");
+    try { sendMessage("bridge-error", {message:error.message || "Microphone access failed."}); } catch (e) {}
+  }
+}
+function stopRecording() {
+  stop.disabled = true;
+  if (recorder && recorder.state === "recording") recorder.stop();
+}
+function sendRecording() {
+  if (!blob) return;
+  send.disabled = true;
+  try {
+    sendMessage("recording", {blob:blob, mimeType:blob.type, size:blob.size});
+    say("Recording sent to the audition form. You can close this window.", "success");
+    setTimeout(() => window.close(), 700);
+  } catch (error) {
+    send.disabled = false;
+    say(error.message || "Could not send recording. Keep this window open and retry.", "error");
+  }
+}
+
+try {
+  if (!window.opener) throw new Error("Open this recorder from the audition form using its Start Recording button.");
+  const suppliedOrigin = new URLSearchParams(window.location.search).get("parentOrigin");
+  if (!suppliedOrigin) throw new Error("The audition form did not provide its origin.");
+  const parsedOrigin = new URL(suppliedOrigin);
+  if (parsedOrigin.protocol !== "https:" || parsedOrigin.origin !== suppliedOrigin || !APPROVED_PARENT_HOST(parsedOrigin.hostname)) {
+    throw new Error("The supplied audition form origin is not approved.");
+  }
+  parentOrigin = parsedOrigin.origin;
+  $("destination").textContent = "Connected securely to the audition form.";
+  sendMessage("bridge-loaded");
+  start.disabled = false;
+  say("Connected. Press Start recording when ready.", "success");
+} catch (error) {
+  say(error.message || "Could not establish a connection.", "error");
+}
+
+window.addEventListener("message", event => {
+  if (event.origin !== parentOrigin || event.source !== window.opener) return;
+  const data = event.data;
+  if (!data || data.channel !== "audition-mic-bridge-v1") return;
+  if (data.type === "ping") {
+    try { sendMessage("ready"); } catch (error) { say(error.message, "error"); }
+  }
+  if (data.type === "stop") stopRecording();
+});
+start.addEventListener("click", startRecording);
+stop.addEventListener("click", stopRecording);
+send.addEventListener("click", sendRecording);
+window.addEventListener("beforeunload", () => {
+  clearInterval(timer);
+  stopTracks();
+  if (previewUrl) URL.revokeObjectURL(previewUrl);
+});
+})();
+</script>
+</body>
+</html>
